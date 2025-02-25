@@ -27,6 +27,7 @@ from .base import (
     QueryParam,
 )
 from .prompt import GRAPH_FIELD_SEP, PROMPTS
+from .token_utils import TokenCounter
 
 
 def chunking_by_token_size(
@@ -726,32 +727,56 @@ async def _find_most_related_text_unit_from_entities(
     text_chunks_db: BaseKVStorage[TextChunkSchema],
     knowledge_graph_inst: BaseGraphStorage,
 ):
+    """找出與給定實體最相關的文本單元。
+
+    Args:
+        node_datas: 實體節點數據列表
+        query_param: 查詢參數
+        text_chunks_db: 文本塊存儲
+        knowledge_graph_inst: 知識圖譜實例
+
+    Returns:
+        list[TextChunkSchema]: 相關的文本單元列表
+    """
+    # 1. 從節點數據中獲取文本單元 ID
     text_units = [
         split_string_by_multi_markers(dp["source_id"], [GRAPH_FIELD_SEP])
         for dp in node_datas
     ]
+
+    # 2. 獲取所有節點的邊緣關係
     edges = await asyncio.gather(
         *[knowledge_graph_inst.get_node_edges(dp["entity_name"]) for dp in node_datas]
     )
+
+    # 3. 收集一跳節點
     all_one_hop_nodes = set()
     for this_edges in edges:
         if not this_edges:
             continue
         all_one_hop_nodes.update([e[1] for e in this_edges])
     all_one_hop_nodes = list(all_one_hop_nodes)
+
+    # 4. 獲取一跳節點數據
     all_one_hop_nodes_data = await asyncio.gather(
         *[knowledge_graph_inst.get_node(e) for e in all_one_hop_nodes]
     )
+
+    # 5. 建立一跳節點的文本單元查找表
     all_one_hop_text_units_lookup = {
         k: set(split_string_by_multi_markers(v["source_id"], [GRAPH_FIELD_SEP]))
         for k, v in zip(all_one_hop_nodes, all_one_hop_nodes_data)
         if v is not None
     }
+
+    # 6. 處理所有文本單元
     all_text_units_lookup = {}
     for index, (this_text_units, this_edges) in enumerate(zip(text_units, edges)):
         for c_id in this_text_units:
             if c_id in all_text_units_lookup:
                 continue
+
+            # 計算關係數量
             relation_counts = 0
             for e in this_edges:
                 if (
@@ -759,26 +784,60 @@ async def _find_most_related_text_unit_from_entities(
                     and c_id in all_one_hop_text_units_lookup[e[1]]
                 ):
                     relation_counts += 1
+
+            # 獲取文本塊數據
+            chunk_data = await text_chunks_db.get_by_id(c_id)
+            if chunk_data is None:
+                logger.warning(f"Missing text chunk for id: {c_id}")
+                continue
+
             all_text_units_lookup[c_id] = {
-                "data": await text_chunks_db.get_by_id(c_id),
+                "data": chunk_data,
                 "order": index,
                 "relation_counts": relation_counts,
             }
+
+    # 7. 檢查並過濾無效數據
     if any([v is None for v in all_text_units_lookup.values()]):
         logger.warning("Text chunks are missing, maybe the storage is damaged")
+        # 過濾掉 None 值
+        all_text_units_lookup = {
+            k: v for k, v in all_text_units_lookup.items()
+            if v is not None
+        }
+
+    if not all_text_units_lookup:
+        logger.warning("No valid text units after filtering")
+        return []
+
+    # 8. 轉換為列表並確保數據完整性
     all_text_units = [
-        {"id": k, **v} for k, v in all_text_units_lookup.items() if v is not None
+        {"id": k, **v}
+        for k, v in all_text_units_lookup.items()
+        if v and isinstance(v, dict) and "data" in v and v["data"] and "content" in v["data"]
     ]
+
+    if not all_text_units:
+        logger.warning("No valid text units found after structure validation")
+        return []
+
+    # 9. 排序：優先考慮順序較前且關係數較多的文本單元
     all_text_units = sorted(
-        all_text_units, key=lambda x: (x["order"], -x["relation_counts"])
-    )
-    all_text_units = truncate_list_by_token_size(
         all_text_units,
-        key=lambda x: x["data"]["content"],
-        max_token_size=query_param.local_max_token_for_text_unit,
+        key=lambda x: (x["order"], -x["relation_counts"])
     )
-    all_text_units: list[TextChunkSchema] = [t["data"] for t in all_text_units]
-    return all_text_units
+
+    # 10. 根據 token 大小截斷
+    try:
+        truncated_units = truncate_list_by_token_size(
+            all_text_units,
+            key=lambda x: x["data"]["content"],
+            max_token_size=query_param.local_max_token_for_text_unit,
+        )
+        return [t["data"] for t in truncated_units]
+    except Exception as e:
+        logger.error(f"Error truncating text units: {str(e)}")
+        return []
 
 
 async def _find_most_related_edges_from_entities(
@@ -789,17 +848,17 @@ async def _find_most_related_edges_from_entities(
     all_related_edges = await asyncio.gather(
         *[knowledge_graph_inst.get_node_edges(dp["entity_name"]) for dp in node_datas]
     )
-    
+
     all_edges = []
     seen = set()
-    
+
     for this_edges in all_related_edges:
         for e in this_edges:
             sorted_edge = tuple(sorted(e))
             if sorted_edge not in seen:
                 seen.add(sorted_edge)
-                all_edges.append(sorted_edge) 
-                
+                all_edges.append(sorted_edge)
+
     all_edges_pack = await asyncio.gather(
         *[knowledge_graph_inst.get_edge(e[0], e[1]) for e in all_edges]
     )
@@ -925,6 +984,12 @@ async def local_query(
     query_param: QueryParam,
     global_config: dict,
 ) -> str:
+    # 初始化 TokenCounter
+    token_counter = TokenCounter(model_name=global_config.get("llm_model", "gpt-4o"))
+
+    # 計算查詢的 Token 數量
+    token_counter.update_query_tokens(query)
+
     use_model_func = global_config["best_model_func"]
     context = await _build_local_query_context(
         query,
@@ -934,19 +999,52 @@ async def local_query(
         text_chunks_db,
         query_param,
     )
-    if query_param.only_need_context:
-        return context
-    if context is None:
-        return PROMPTS["fail_response"]
+
+    # 計算檢索數據的 Token 數量
+    if context:
+        token_counter.update_retrieved_data_tokens([context])
+
     sys_prompt_temp = PROMPTS["local_rag_response"]
     sys_prompt = sys_prompt_temp.format(
         context_data=context, response_type=query_param.response_type
     )
+
+    # 計算系統提示的 Token 數量
+    token_counter.update_system_prompt_tokens(sys_prompt)
+
+    # 計算完整提示的 Token 數量
+    full_prompt = f"{sys_prompt}\n\n{query}"
+    token_counter.update_total_prompt_tokens(full_prompt)
+
     response = await use_model_func(
         query,
         system_prompt=sys_prompt,
     )
-    return response
+
+    # 計算回應的 Token 數量
+    token_counter.update_completion_tokens(response)
+
+    # 獲取 Token 統計信息
+    token_stats = token_counter.get_stats()
+
+    # 包裝響應
+    if isinstance(response, str):
+        if query_param.stream:
+            # 如果是流式模式，返回異步迭代器
+            async def wrapped_generator():
+                yield response
+                yield {"token_stats": token_stats}
+            return wrapped_generator()
+        else:
+            # 如果不是流式模式，返回字典
+            return {"response": response, "token_stats": token_stats}
+    else:
+        # 如果已經是異步迭代器，包裝它以在最後添加 Token 統計信息
+        async def wrapped_generator():
+            async for chunk in response:
+                yield chunk
+            yield {"token_stats": token_stats}
+        return wrapped_generator()
 
 
 async def _map_global_communities(
@@ -1003,6 +1101,12 @@ async def global_query(
     query_param: QueryParam,
     global_config: dict,
 ) -> str:
+    # 初始化 TokenCounter
+    token_counter = TokenCounter(model_name=global_config.get("llm_model", "gpt-4o"))
+
+    # 計算查詢的 Token 數量
+    token_counter.update_query_tokens(query)
+
     community_schema = await knowledge_graph_inst.community_schema()
     community_schema = {
         k: v for k, v in community_schema.items() if v["level"] <= query_param.level
@@ -1070,16 +1174,51 @@ Importance Score: {dp['score']}
 """
         )
     points_context = "\n".join(points_context)
-    if query_param.only_need_context:
-        return points_context
+
+    # 計算檢索數據的 Token 數量
+    token_counter.update_retrieved_data_tokens([points_context])
+
     sys_prompt_temp = PROMPTS["global_reduce_rag_response"]
+    sys_prompt = sys_prompt_temp.format(
+        report_data=points_context, response_type=query_param.response_type
+    )
+
+    # 計算系統提示的 Token 數量
+    token_counter.update_system_prompt_tokens(sys_prompt)
+
+    # 計算完整提示的 Token 數量
+    full_prompt = f"{sys_prompt}\n\n{query}"
+    token_counter.update_total_prompt_tokens(full_prompt)
+
     response = await use_model_func(
         query,
-        sys_prompt_temp.format(
-            report_data=points_context, response_type=query_param.response_type
-        ),
+        system_prompt=sys_prompt,
     )
-    return response
+
+    # 計算回應的 Token 數量
+    token_counter.update_completion_tokens(response)
+
+    # 獲取 Token 統計信息
+    token_stats = token_counter.get_stats()
+
+    # 包裝響應
+    if isinstance(response, str):
+        if query_param.stream:
+            # 如果是流式模式，返回異步迭代器
+            async def wrapped_generator():
+                yield response
+                yield {"token_stats": token_stats}
+            return wrapped_generator()
+        else:
+            # 如果不是流式模式，返回字典
+            return {"response": response, "token_stats": token_stats}
+    else:
+        # 如果已經是異步迭代器，包裝它以在最後添加 Token 統計信息
+        async def wrapped_generator():
+            async for chunk in response:
+                yield chunk
+            yield {"token_stats": token_stats}
+        return wrapped_generator()
 
 
 async def naive_query(
@@ -1089,6 +1228,12 @@ async def naive_query(
     query_param: QueryParam,
     global_config: dict,
 ):
+    # 初始化 TokenCounter
+    token_counter = TokenCounter(model_name=global_config.get("llm_model", "gpt-4o"))
+
+    # 計算查詢的 Token 數量
+    token_counter.update_query_tokens(query)
+
     use_model_func = global_config["best_model_func"]
     results = await chunks_vdb.query(query, top_k=query_param.top_k)
     if not len(results):
@@ -1103,14 +1248,49 @@ async def naive_query(
     )
     logger.info(f"Truncate {len(chunks)} to {len(maybe_trun_chunks)} chunks")
     section = "--New Chunk--\n".join([c["content"] for c in maybe_trun_chunks])
-    if query_param.only_need_context:
-        return section
+
+    # 計算檢索數據的 Token 數量
+    chunk_texts = [c["content"] for c in maybe_trun_chunks]
+    token_counter.update_retrieved_data_tokens(chunk_texts)
+
     sys_prompt_temp = PROMPTS["naive_rag_response"]
     sys_prompt = sys_prompt_temp.format(
         content_data=section, response_type=query_param.response_type
     )
+
+    # 計算系統提示的 Token 數量
+    token_counter.update_system_prompt_tokens(sys_prompt)
+
+    # 計算完整提示的 Token 數量
+    full_prompt = f"{sys_prompt}\n\n{query}"
+    token_counter.update_total_prompt_tokens(full_prompt)
+
     response = await use_model_func(
         query,
         system_prompt=sys_prompt,
     )
-    return response
+
+    # 計算回應的 Token 數量
+    token_counter.update_completion_tokens(response)
+
+    # 獲取 Token 統計信息
+    token_stats = token_counter.get_stats()
+
+    # 包裝響應
+    if isinstance(response, str):
+        if query_param.stream:
+            # 如果是流式模式，返回異步迭代器
+            async def wrapped_generator():
+                yield response
+                yield {"token_stats": token_stats}
+            return wrapped_generator()
+        else:
+            # 如果不是流式模式，返回字典
+            return {"response": response, "token_stats": token_stats}
+    else:
+        # 如果已經是異步迭代器，包裝它以在最後添加 Token 統計信息
+        async def wrapped_generator():
+            async for chunk in response:
+                yield chunk
+            yield {"token_stats": token_stats}
+        return wrapped_generator()

@@ -27,6 +27,8 @@ class QueryParam:
     global_special_community_map_llm_kwargs: dict = field(
         default_factory=lambda: {"response_format": {"type": "json_object"}}
     )
+    only_need_prompt: bool = False
+    stream: bool = False
 
 
 TextChunkSchema = TypedDict(
