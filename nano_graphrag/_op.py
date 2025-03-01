@@ -27,7 +27,7 @@ from .base import (
     QueryParam,
 )
 from .prompt import GRAPH_FIELD_SEP, PROMPTS
-from .token_utils import TokenCounter
+from nano_graphrag.performance_utils import RAGPerformanceTracker
 
 
 def chunking_by_token_size(
@@ -984,12 +984,18 @@ async def local_query(
     query_param: QueryParam,
     global_config: dict,
 ) -> str:
-    # 初始化 TokenCounter
-    token_counter = TokenCounter(model_name=global_config.get("llm_model", "gpt-4o"))
-
+    # 初始化 RAGPerformanceTracker
+    performance_tracker = RAGPerformanceTracker(model_name=global_config.get("llm_model", "gpt-4o"))
+    
+    # 开始计时
+    performance_tracker.start_tracking()
+    
     # 計算查詢的 Token 數量
-    token_counter.update_query_tokens(query)
-
+    performance_tracker.update_query_tokens(query)
+    
+    # 开始检索计时
+    performance_tracker.start_retrieve_time()
+    
     use_model_func = global_config["best_model_func"]
     context = await _build_local_query_context(
         query,
@@ -999,33 +1005,42 @@ async def local_query(
         text_chunks_db,
         query_param,
     )
-
+    
+    # 结束检索计时
+    performance_tracker.end_retrieve_time()
+    
     # 計算檢索數據的 Token 數量
     if context:
-        token_counter.update_retrieved_data_tokens([context])
+        performance_tracker.update_retrieved_data_tokens([context])
 
     sys_prompt_temp = PROMPTS["local_rag_response"]
     sys_prompt = sys_prompt_temp.format(
         context_data=context, response_type=query_param.response_type
     )
 
-    # 計算系統提示的 Token 數量
-    token_counter.update_system_prompt_tokens(sys_prompt)
-
     # 計算完整提示的 Token 數量
     full_prompt = f"{sys_prompt}\n\n{query}"
-    token_counter.update_total_prompt_tokens(full_prompt)
-
+    performance_tracker.update_inference_input_tokens(full_prompt)
+    
+    # 开始 LLM 推理计时
+    performance_tracker.start_llm_time()
+    
     response = await use_model_func(
         query,
         system_prompt=sys_prompt,
     )
+    
+    # 结束 LLM 推理计时
+    performance_tracker.end_llm_time()
 
     # 計算回應的 Token 數量
-    token_counter.update_completion_tokens(response)
+    performance_tracker.update_inference_output_tokens(response)
+    
+    # 结束总计时
+    performance_tracker.end_tracking()
 
-    # 獲取 Token 統計信息
-    token_stats = token_counter.get_stats()
+    # 獲取統計信息
+    stats = performance_tracker.get_all_stats()
 
     # 包裝響應
     if isinstance(response, str):
@@ -1033,17 +1048,17 @@ async def local_query(
             # 如果是流式模式，返回異步迭代器
             async def wrapped_generator():
                 yield response
-                yield {"token_stats": token_stats}
+                yield {"performance_stats": stats}
             return wrapped_generator()
         else:
             # 如果不是流式模式，返回字典
-            return {"response": response, "token_stats": token_stats}
+            return {"response": response, "performance_stats": stats}
     else:
-        # 如果已經是異步迭代器，包裝它以在最後添加 Token 統計信息
+        # 如果已經是異步迭代器，包裝它以在最後添加統計信息
         async def wrapped_generator():
             async for chunk in response:
                 yield chunk
-            yield {"token_stats": token_stats}
+            yield {"performance_stats": stats}
         return wrapped_generator()
 
 
@@ -1055,6 +1070,7 @@ async def _map_global_communities(
 ):
     use_string_json_convert_func = global_config["convert_response_to_json_func"]
     use_model_func = global_config["best_model_func"]
+    tiktoken_model_name = global_config.get("tiktoken_model_name", "gpt-4o")
     community_groups = []
     while len(communities_data):
         this_group = truncate_list_by_token_size(
@@ -1065,7 +1081,7 @@ async def _map_global_communities(
         community_groups.append(this_group)
         communities_data = communities_data[len(this_group) :]
 
-    async def _process(community_truncated_datas: list[CommunitySchema]) -> dict:
+    async def _process(community_truncated_datas: list[CommunitySchema]) -> tuple[list, int]:
         communities_section_list = [["id", "content", "rating", "importance"]]
         for i, c in enumerate(community_truncated_datas):
             communities_section_list.append(
@@ -1079,17 +1095,26 @@ async def _map_global_communities(
         community_context = list_of_list_to_csv(communities_section_list)
         sys_prompt_temp = PROMPTS["global_map_rag_points"]
         sys_prompt = sys_prompt_temp.format(context_data=community_context)
+        
+        # 计算这个处理过程使用的token
+        map_prompt_tokens = len(encode_string_by_tiktoken(sys_prompt + query, model_name=tiktoken_model_name))
+        
         response = await use_model_func(
             query,
             system_prompt=sys_prompt,
             **query_param.global_special_community_map_llm_kwargs,
         )
         data = use_string_json_convert_func(response)
-        return data.get("points", [])
+        return data.get("points", []), map_prompt_tokens
 
     logger.info(f"Grouping to {len(community_groups)} groups for global search")
-    responses = await asyncio.gather(*[_process(c) for c in community_groups])
-    return responses
+    results = await asyncio.gather(*[_process(c) for c in community_groups])
+    
+    # 分离结果和token计数
+    responses = [r[0] for r in results]
+    total_map_tokens = sum(r[1] for r in results)
+    
+    return responses, total_map_tokens
 
 
 async def global_query(
@@ -1101,11 +1126,17 @@ async def global_query(
     query_param: QueryParam,
     global_config: dict,
 ) -> str:
-    # 初始化 TokenCounter
-    token_counter = TokenCounter(model_name=global_config.get("llm_model", "gpt-4o"))
-
+    # 初始化 RAGPerformanceTracker
+    performance_tracker = RAGPerformanceTracker(model_name=global_config.get("llm_model", "gpt-4o"))
+    
+    # 开始计时
+    performance_tracker.start_tracking()
+    
     # 計算查詢的 Token 數量
-    token_counter.update_query_tokens(query)
+    performance_tracker.update_query_tokens(query)
+    
+    # 开始检索计时
+    performance_tracker.start_retrieve_time()
 
     community_schema = await knowledge_graph_inst.community_schema()
     community_schema = {
@@ -1139,7 +1170,7 @@ async def global_query(
     )
     logger.info(f"Revtrieved {len(community_datas)} communities")
 
-    map_communities_points = await _map_global_communities(
+    map_communities_points, total_retrieval_prompt_tokens = await _map_global_communities(
         query, community_datas, query_param, global_config
     )
     final_support_points = []
@@ -1175,31 +1206,42 @@ Importance Score: {dp['score']}
         )
     points_context = "\n".join(points_context)
 
+    # 结束检索计时
+    performance_tracker.end_retrieve_time()
+
+    performance_tracker.update_retrieval_prompt_tokens(total_retrieval_prompt_tokens)
+
     # 計算檢索數據的 Token 數量
-    token_counter.update_retrieved_data_tokens([points_context])
+    performance_tracker.update_retrieved_data_tokens([points_context])
 
     sys_prompt_temp = PROMPTS["global_reduce_rag_response"]
     sys_prompt = sys_prompt_temp.format(
         report_data=points_context, response_type=query_param.response_type
     )
 
-    # 計算系統提示的 Token 數量
-    token_counter.update_system_prompt_tokens(sys_prompt)
-
     # 計算完整提示的 Token 數量
     full_prompt = f"{sys_prompt}\n\n{query}"
-    token_counter.update_total_prompt_tokens(full_prompt)
+    performance_tracker.update_inference_input_tokens(full_prompt)
+    
+    # 开始 LLM 推理计时
+    performance_tracker.start_llm_time()
 
     response = await use_model_func(
         query,
         system_prompt=sys_prompt,
     )
+    
+    # 结束 LLM 推理计时
+    performance_tracker.end_llm_time()
 
     # 計算回應的 Token 數量
-    token_counter.update_completion_tokens(response)
+    performance_tracker.update_inference_output_tokens(response)
+    
+    # 结束总计时
+    performance_tracker.end_tracking()
 
-    # 獲取 Token 統計信息
-    token_stats = token_counter.get_stats()
+    # 獲取統計信息
+    stats = performance_tracker.get_all_stats()
 
     # 包裝響應
     if isinstance(response, str):
@@ -1207,17 +1249,17 @@ Importance Score: {dp['score']}
             # 如果是流式模式，返回異步迭代器
             async def wrapped_generator():
                 yield response
-                yield {"token_stats": token_stats}
+                yield {"performance_stats": stats}
             return wrapped_generator()
         else:
             # 如果不是流式模式，返回字典
-            return {"response": response, "token_stats": token_stats}
+            return {"response": response, "performance_stats": stats}
     else:
-        # 如果已經是異步迭代器，包裝它以在最後添加 Token 統計信息
+        # 如果已經是異步迭代器，包裝它以在最後添加統計信息
         async def wrapped_generator():
             async for chunk in response:
                 yield chunk
-            yield {"token_stats": token_stats}
+            yield {"staperformance_statsts": stats}
         return wrapped_generator()
 
 
@@ -1228,11 +1270,17 @@ async def naive_query(
     query_param: QueryParam,
     global_config: dict,
 ):
-    # 初始化 TokenCounter
-    token_counter = TokenCounter(model_name=global_config.get("llm_model", "gpt-4o"))
-
+    # 初始化 RAGPerformanceTracker
+    performance_tracker = RAGPerformanceTracker(model_name=global_config.get("llm_model", "gpt-4o"))
+    
+    # 开始计时
+    performance_tracker.start_tracking()
+    
     # 計算查詢的 Token 數量
-    token_counter.update_query_tokens(query)
+    performance_tracker.update_query_tokens(query)
+    
+    # 开始检索计时
+    performance_tracker.start_retrieve_time()
 
     use_model_func = global_config["best_model_func"]
     results = await chunks_vdb.query(query, top_k=query_param.top_k)
@@ -1248,33 +1296,45 @@ async def naive_query(
     )
     logger.info(f"Truncate {len(chunks)} to {len(maybe_trun_chunks)} chunks")
     section = "--New Chunk--\n".join([c["content"] for c in maybe_trun_chunks])
+    
+    # 结束检索计时
+    performance_tracker.end_retrieve_time()
 
     # 計算檢索數據的 Token 數量
     chunk_texts = [c["content"] for c in maybe_trun_chunks]
-    token_counter.update_retrieved_data_tokens(chunk_texts)
+    performance_tracker.update_retrieved_data_tokens(chunk_texts)
 
     sys_prompt_temp = PROMPTS["naive_rag_response"]
     sys_prompt = sys_prompt_temp.format(
         content_data=section, response_type=query_param.response_type
     )
 
-    # 計算系統提示的 Token 數量
-    token_counter.update_system_prompt_tokens(sys_prompt)
+    # 計算系統提示的 Token 數量 - 使用 retrieval_prompt_tokens 替代
+    # performance_tracker.update_retrieval_prompt_tokens(sys_prompt)
 
     # 計算完整提示的 Token 數量
     full_prompt = f"{sys_prompt}\n\n{query}"
-    token_counter.update_total_prompt_tokens(full_prompt)
+    performance_tracker.update_inference_input_tokens(full_prompt)
+    
+    # 开始 LLM 推理计时
+    performance_tracker.start_llm_time()
 
     response = await use_model_func(
         query,
         system_prompt=sys_prompt,
     )
+    
+    # 结束 LLM 推理计时
+    performance_tracker.end_llm_time()
 
     # 計算回應的 Token 數量
-    token_counter.update_completion_tokens(response)
+    performance_tracker.update_inference_output_tokens(response)
+    
+    # 结束总计时
+    performance_tracker.end_tracking()
 
-    # 獲取 Token 統計信息
-    token_stats = token_counter.get_stats()
+    # 獲取統計信息
+    stats = performance_tracker.get_all_stats()
 
     # 包裝響應
     if isinstance(response, str):
@@ -1282,15 +1342,15 @@ async def naive_query(
             # 如果是流式模式，返回異步迭代器
             async def wrapped_generator():
                 yield response
-                yield {"token_stats": token_stats}
+                yield {"performance_stats": stats}
             return wrapped_generator()
         else:
             # 如果不是流式模式，返回字典
-            return {"response": response, "token_stats": token_stats}
+            return {"response": response, "performance_stats": stats}
     else:
-        # 如果已經是異步迭代器，包裝它以在最後添加 Token 統計信息
+        # 如果已經是異步迭代器，包裝它以在最後添加統計信息
         async def wrapped_generator():
             async for chunk in response:
                 yield chunk
-            yield {"token_stats": token_stats}
+            yield {"performance_stats": stats}
         return wrapped_generator()
